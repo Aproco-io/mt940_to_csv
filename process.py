@@ -227,6 +227,7 @@ def match_mt940_with_invoices(mt940_csv_path, invoices_json):
         match_found = False  # Flaga dla dopasowania
         invoice_number_match = ""  # Zmienna na numer faktury
         invoice_filename = ""  # Zmienna na nazwę pliku faktury
+        invoice_details = {}  # Zmienna na dodatkowe informacje z faktury
 
         # Iteracja po wszystkich fakturach w invoices_json
         for invoice in invoices_json:
@@ -239,43 +240,35 @@ def match_mt940_with_invoices(mt940_csv_path, invoices_json):
 
             # Sprawdzanie, czy numer faktury znajduje się w tytule
             if invoice_number in title:
-                print(f"Found invoice number {invoice_number} in transaction title: {title}")
                 match_found = True  # Numer faktury dopasowany
                 invoice_number_match = invoice_number  # Zapisanie numeru faktury
                 invoice_filename = invoice['filename']  # Zapisanie nazwy pliku
+                invoice_details = invoice['extracted_fields']  # Zapisanie szczegółów faktury
 
             # Sprawdzanie, czy kwota i waluta są zgodne
             if amount == invoice_amount and currency == invoice_currency:
-                print(f"Found match for amount {invoice_amount} and currency {invoice_currency}")
                 match_found = True  # Kwota i waluta dopasowane
                 invoice_number_match = invoice_number  # Zapisanie numeru faktury
                 invoice_filename = invoice['filename']  # Zapisanie nazwy pliku
+                invoice_details = invoice['extracted_fields']  # Zapisanie szczegółów faktury
 
-        # Tworzenie rekordu bez informacji o fakturach, jeśli brak dopasowania
-        if match_found:
-            matched_record = {
-                'Account': row['Account'],
-                'Transaction date': row['Transaction date'],
-                'Transaction amount': row['Transaction amount'],
-                'Transaction currency': row['Transaction currency'],
-                'Transaction ID': row['Transaction ID'],
-                'Transaction title': title,
-                'Match': 'yes',
-                'Invoice filename': invoice_filename,
-                'Invoice number': invoice_number_match
-            }
-        else:
-            matched_record = {
-                'Account': row['Account'],
-                'Transaction date': row['Transaction date'],
-                'Transaction amount': row['Transaction amount'],
-                'Transaction currency': row['Transaction currency'],
-                'Transaction ID': row['Transaction ID'],
-                'Transaction title': title,
-                'Match': 'no',
-                'Invoice filename': '',
-                'Invoice number': ''
-            }
+        # Tworzenie rekordu z dodatkowymi informacjami o fakturze, jeśli dopasowanie
+        matched_record = {
+            'Account': row['Account'],
+            'Transaction date': row['Transaction date'],
+            'Transaction amount': row['Transaction amount'],
+            'Transaction currency': row['Transaction currency'],
+            'Transaction ID': row['Transaction ID'],
+            'Transaction title': title,
+            'Match': 'yes' if match_found else 'no',
+            'Invoice filename': invoice_filename,
+            'Invoice number': invoice_number_match,
+            'Invoice account number': invoice_details.get('Account number', ''),
+            'Invoice transaction date': invoice_details.get('Transaction date', ''),
+            'Invoice transaction title': invoice_details.get('Transaction title', ''),
+            'Invoice amount': invoice_details.get('Amount', ''),
+            'Invoice currency': invoice_details.get('Currency', '')
+        }
 
         # Dodanie rekordu do listy
         all_transactions.append(matched_record)
@@ -284,17 +277,112 @@ def match_mt940_with_invoices(mt940_csv_path, invoices_json):
     all_transactions_df = pd.DataFrame(all_transactions)
 
     # Zmiana kolejności kolumn
-    all_transactions_df = all_transactions_df[
-        ['Account', 'Transaction date', 'Transaction amount', 'Transaction currency',
-         'Transaction ID', 'Transaction title', 'Match', 'Invoice filename', 'Invoice number']]
+    all_transactions_df = all_transactions_df[[
+        'Account', 'Transaction date', 'Transaction amount', 'Transaction currency',
+        'Transaction ID', 'Transaction title', 'Match',
+        'Invoice filename', 'Invoice number', 'Invoice amount', 'Invoice currency',
+        'Invoice transaction date', 'Invoice transaction title', 'Invoice account number'
+    ]]
 
     # Sortowanie: transakcje z dopasowaniem ("yes") na samej górze
     all_transactions_df = all_transactions_df.sort_values(by='Match', ascending=False)
 
-    # Zapisanie wyników do pliku CSV, z kolumną "Match"
-    all_transactions_df.to_csv('matched_transactions.csv', index=False, sep='|')
+    # Zapis do Excela z kolorowaniem, centrowaniem i dodawaniem podsumowania
+    with pd.ExcelWriter('matched_transactions.xlsx', engine='xlsxwriter') as writer:
+        # Zapis DataFrame do Excela
+        all_transactions_df.to_excel(writer, index=False, sheet_name='Matches')
 
-    print("Wyniki zostały zapisane do pliku CSV.")
+        # Po zapisaniu danych do Excela, pobieramy workbook i worksheet
+        workbook  = writer.book
+        worksheet = writer.sheets['Matches']
+
+        # Stworzenie formatu do centrowania komórek
+        center_format = workbook.add_format({'align': 'center', 'valign': 'vcenter'})
+
+        # Kolorowanie komórek na podstawie dopasowania
+        for idx, col in enumerate(all_transactions_df.columns):
+            worksheet.conditional_format(1, idx, len(all_transactions_df), idx, {
+                'type': 'cell',
+                'criteria': 'equal to',
+                'value': '"yes"',
+                'format': workbook.add_format({'bg_color': '#90EE90', 'align': 'center', 'valign': 'vcenter'})
+            })
+            worksheet.conditional_format(1, idx, len(all_transactions_df), idx, {
+                'type': 'cell',
+                'criteria': 'equal to',
+                'value': '"no"',
+                'format': workbook.add_format({'bg_color': '#FF474C', 'align': 'center', 'valign': 'vcenter'})
+            })
+
+        # Automatyczne rozsunięcie kolumn na podstawie szerokości danych i centrowanie
+        for i, col in enumerate(all_transactions_df.columns):
+            max_len = max(all_transactions_df[col].astype(str).map(len).max(), len(col)) + 2  # +2 for padding
+            worksheet.set_column(i, i, max_len, center_format)  # Dodanie center_format do każdej kolumny
+
+        # Wywołanie funkcji summary i zapisanie podsumowania w kolejnej zakładce
+        summary(all_transactions_df, writer)
+
+    print("Wyniki zostały zapisane do pliku Excel z kolorowaniem i dostosowaną szerokością kolumn.")
+
+
+def summary(df, writer):
+    """
+    Function to generate transaction summaries for each account and save to an Excel file.
+
+    Parameters:
+    df (DataFrame): The DataFrame containing transaction data.
+    writer (pd.ExcelWriter): ExcelWriter object to write to the same file.
+    """
+
+    # Convert 'Transaction amount' to numeric, ensuring proper handling of debits and credits
+    df['Transaction amount'] = pd.to_numeric(df['Transaction amount'], errors='coerce')
+
+    # Create the summary DataFrame and include the 'Currency' column next to 'Account'
+    summary_df = df.groupby(['Account', 'Transaction currency']).agg(
+        total_transactions=('Transaction amount', 'count'),
+        total_credit=('Transaction amount', lambda x: x[x > 0].sum()),  # Total of positive amounts (credits)
+        total_debit=('Transaction amount', lambda x: x[x < 0].sum()),  # Total of negative amounts (debits)
+        credit_count=('Transaction amount', lambda x: (x > 0).sum()),  # Count of positive amounts (credits)
+        debit_count=('Transaction amount', lambda x: (x < 0).sum())  # Count of negative amounts (debits)
+    ).reset_index()
+
+    # Calculate the final balance (kwota ostateczna)
+    summary_df['final_balance'] = summary_df['total_credit'] + summary_df['total_debit']  # Add credits and debits
+
+    # Rename 'Transaction currency' to 'Account currency'
+    summary_df = summary_df.rename(columns={'Transaction currency': 'Account currency'})
+
+    # Rename columns as per the desired output
+    summary_df = summary_df.rename(columns={
+        'Account': 'Account',
+        'Transaction currency': 'Account currency',
+        'total_credit': 'Total credit',
+        'total_debit': 'Total debit',
+        'final_balance': 'Final balance',
+        'total_transactions': 'Total transactions',
+        'credit_count': 'Credit count',
+        'debit_count': 'Debit count'
+    })
+
+    # Reorganize columns in the desired order
+    summary_df = summary_df[[
+        'Account', 'Account currency', 'Total credit', 'Total debit', 'Final balance',
+        'Total transactions', 'Credit count', 'Debit count'
+    ]]
+
+    # Write the summary to a new sheet in the same Excel file
+    summary_df.to_excel(writer, sheet_name='Summary', index=False)
+
+    # Get the workbook and worksheet to adjust column widths
+    workbook = writer.book
+    worksheet = writer.sheets['Summary']
+
+    # Adjust column widths based on the longest value in each column
+    for i, col in enumerate(summary_df.columns):
+        max_len = max(summary_df[col].astype(str).map(len).max(), len(col)) + 2  # +2 for padding
+        worksheet.set_column(i, i, max_len)
+
+    print(f"Podsumowanie zapisano w arkuszu 'Summary' z dostosowaną szerokością kolumn.")
 
 
 def match_invoices_with_mt940(mt940_csv_path, invoices_json):
